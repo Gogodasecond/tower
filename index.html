@@ -7847,10 +7847,12 @@ const NET_PREFIX = 'saltflat-tower-v1-';
 const NET_SNAP_MS = 50;          // snapshot interval (20/s)
 const NET_DELAY = 110;           // guest draws the world this far behind the newest snapshot
 const NET_CHUNK = 48000;         // keep single data-channel messages small for every browser
+const NET_RELAY_SNAP_MS = 125;    // relay fallback: fewer snapshots (8/s)...
+const NET_RELAY_DELAY = 320;      // ...and a bigger buffer, since every message goes via a server
 const NET_ALPHA = 'ABCDEFGHJKMNPQRSTUVWXYZ23456789';
 const NET_PARTNER_COL = '#2f6db0';
 const NET = { role: null, peer: null, conn: null, code: '', status: 'off', err: '', ready: false, lastSnap: 0, snapN: 0,
-  events: [], partner: null, rtt: 0, lastPing: 0, lastCur: 0, libP: null, h: null, modalSent: null, partSeq: 0, parts: {} };
+  events: [], partner: null, rtt: 0, lastPing: 0, lastCur: 0, libP: null, mqttP: null, relays: [], h: null, modalSent: null, partSeq: 0, parts: {} };
 const G = { byNid: new Map(), maps: {}, queue: [], dict: [], timeErr: 0 };
 
 // What gets mirrored, per entity list. `fast` keys go out every snapshot; the
@@ -7979,7 +7981,138 @@ function netErrText(err) {
 function netNewCode() { const a = crypto.getRandomValues(new Uint32Array(5)); let s = ''; for (const v of a) s += NET_ALPHA[v % NET_ALPHA.length]; return s; }
 function netAlive() { return !!(NET.conn && NET.conn.open); }
 
+// ---- relay fallback -------------------------------------------------------
+// Two homes often can't link directly, and PeerJS's free TURN relays no longer
+// exist. So when the direct link fails, the same messages go through a public
+// MQTT broker over a normal secure WebSocket. NetRelayConn matches the parts of
+// a PeerJS connection the game uses (open, send, close, on), so the rest of the
+// co-op code doesn't know the difference. Slower than direct, but it works on
+// nearly any network that can load a web page.
+const NET_BROKERS = ['wss://broker.emqx.io:8084/mqtt', 'wss://broker.hivemq.com:8884/mqtt'];
+const NET_TOPIC = 'saltflat-tower/v1/';
+const NET_DIRECT_MS = 6000;       // how long the guest gives the direct link
+const NET_RELAY_TRY_MS = 6000;    // how long the guest waits on each broker
+const NET_RELAY_TIMEOUT = 45000;  // silence this long means the other side is gone
+function netSnapMs() { return NET.conn && NET.conn.relay ? NET_RELAY_SNAP_MS : NET_SNAP_MS; }
+function netDelay() { return NET.conn && NET.conn.relay ? NET_RELAY_DELAY : NET_DELAY; }
+class NetRelayConn {
+  constructor(client, out, inn) {
+    this.relay = true; this.open = false; this.client = client; this.out = out; this.inn = inn;
+    this.pending = 0; this.seen = performance.now(); this.h = {};
+    this.onMsg = (topic, payload) => { if (topic === this.inn) this.got(payload.toString()); };
+    client.on('message', this.onMsg);
+    client.subscribe(inn, { qos: 1 });
+    this.beat = setInterval(() => {
+      if (performance.now() - this.seen > NET_RELAY_TIMEOUT) { this.close(); return; }
+      this.raw('~hb');
+    }, 3000);
+  }
+  on(ev, fn) { this.h[ev] = fn; }
+  raw(s) { this.pending++; this.client.publish(this.out, s, { qos: 1 }, () => { this.pending--; }); }
+  send(s) { if (this.open) this.raw(s); }
+  got(d) {
+    this.seen = performance.now();
+    if (d === '~hb') return;
+    if (d === '~ok') { if (!this.open) { this.open = true; if (this.h.open) this.h.open(); } return; }
+    if (d === '~bye') { this.drop(); return; }
+    if (this.h.data) this.h.data(d);
+  }
+  drop() {
+    if (this.dead) return;
+    this.dead = true; this.open = false;
+    clearInterval(this.beat);
+    this.client.removeListener('message', this.onMsg);
+    try { this.client.unsubscribe(this.inn); } catch (e) {}
+    if (this.h.close) this.h.close();
+  }
+  close() { if (this.dead) return; try { this.raw('~bye'); } catch (e) {} this.drop(); }
+}
+function netLoadMqtt() {
+  if (window.mqtt) return Promise.resolve(window.mqtt);
+  if (NET.mqttP) return NET.mqttP;
+  const urls = ['https://cdn.jsdelivr.net/npm/mqtt@5.10.1/dist/mqtt.min.js', 'https://unpkg.com/mqtt@5.10.1/dist/mqtt.min.js'];
+  NET.mqttP = new Promise((res, rej) => {
+    let i = 0;
+    const next = () => {
+      if (i >= urls.length) { NET.mqttP = null; rej(new Error('Could not load the relay library.')); return; }
+      const s = document.createElement('script'); s.src = urls[i++]; s.async = true;
+      s.onload = () => window.mqtt ? res(window.mqtt) : next();
+      s.onerror = () => { s.remove(); next(); };
+      document.head.appendChild(s);
+    };
+    next();
+  });
+  return NET.mqttP;
+}
+function netRelayStop() {
+  for (const c of NET.relays) { try { c.end(false); } catch (e) {} }
+  NET.relays = [];
+}
+// Host: listen on every broker as soon as the lobby has its code.
+async function netRelayHost(code) {
+  let mqtt; try { mqtt = await netLoadMqtt(); } catch (e) { console.warn('[co-op] relay unavailable', e); return; }
+  if (NET.role !== 'host' || NET.code !== code) return;
+  netRelayStop();
+  const base = NET_TOPIC + code + '/', lobby = base + 'lobby';
+  for (const url of NET_BROKERS) {
+    const client = mqtt.connect(url, { connectTimeout: 6000, reconnectPeriod: 3000 });
+    NET.relays.push(client);
+    client.on('error', () => {});
+    client.on('connect', () => client.subscribe(lobby, { qos: 0 }));
+    client.on('message', (topic, payload) => {
+      if (topic !== lobby || NET.role !== 'host' || NET.code !== code) return;
+      const sid = payload.toString().replace(/[^a-z0-9]/g, '');
+      if (!sid) return;
+      if (NET.conn && NET.conn.relay && NET.conn.sid === sid) { NET.conn.raw('~ok'); return; }   // a repeated hello
+      if (netAlive()) return;                                                                     // lobby is full
+      const conn = new NetRelayConn(client, base + sid + '/g', base + sid + '/h');
+      conn.sid = sid; conn.open = true;
+      conn.raw('~ok');
+      netHostAdopt(conn);
+    });
+  }
+}
+// Guest: say hello on each broker in turn until the host answers.
+async function netRelayJoin(code, directErr) {
+  const live = () => NET.role === 'guest' && NET.code === code && NET.status === 'connecting';
+  const failed = (msg) => { if (!live()) return; netRelayStop(); NET.status = 'error'; NET.err = msg; netUi(); };
+  let mqtt; try { mqtt = await netLoadMqtt(); } catch (e) { failed(directErr ? netErrText(directErr) : e.message); return; }
+  const base = NET_TOPIC + code + '/', sid = netNewCode().toLowerCase() + Date.now().toString(36);
+  for (const url of NET_BROKERS) {
+    if (!live()) return;
+    const client = mqtt.connect(url, { connectTimeout: 5000, reconnectPeriod: 0 });
+    NET.relays.push(client);
+    client.on('error', () => {});
+    const conn = new NetRelayConn(client, base + sid + '/h', base + sid + '/g');
+    const ok = await new Promise(res => {
+      const hello = () => { if (client.connected) client.publish(base + 'lobby', sid, { qos: 0 }); };
+      const every = setInterval(hello, 1000);
+      const end = v => { clearInterval(every); clearTimeout(limit); res(v); };
+      const limit = setTimeout(() => end(false), NET_RELAY_TRY_MS);
+      client.on('connect', hello);
+      conn.on('open', () => end(true));
+    });
+    if (!live()) { conn.close(); return; }
+    if (!ok) { conn.h = {}; conn.drop(); try { client.end(true); } catch (e) {} continue; }
+    NET.conn = conn;
+    conn.on('data', netRecv);
+    conn.on('close', () => { if (NET.conn === conn) netHostGone(); });
+    NET.status = 'lobby'; netSend({ t: 'hello', v: NET_VERSION }); netUi();
+    return;
+  }
+  failed('Couldn\'t reach that game. Make sure your friend\'s lobby is still open and the code is right, or ask them to create a new one.');
+}
+
 // ---- lobby ----------------------------------------------------------------
+// A friend reached the lobby, directly or through the relay.
+function netHostAdopt(conn) {
+  if (netAlive()) { conn.on('open', () => { try { conn.send(JSON.stringify({ t: 'full' })); } catch (e) {} setTimeout(() => conn.close(), 400); }); return; }
+  NET.conn = conn;
+  conn.on('data', netRecv);
+  conn.on('close', () => { if (NET.conn !== conn) return; NET.conn = null; NET.partner = null; NET.rtt = 0;
+    if (NET.role === 'host') { NET.status = 'waiting'; netUi(); if (state.phase === 'playing') pushToastLocal('Your friend left the game', '#c8361c'); } });
+  conn.on('error', () => {});
+}
 async function netHost() {
   netLeave(true);
   NET.role = 'host'; NET.status = 'opening'; NET.err = ''; netUi();
@@ -7989,16 +8122,8 @@ async function netHost() {
   const open = (tries) => {
     NET.code = netNewCode();
     const peer = NET.peer = new Peer(NET_PREFIX + NET.code.toLowerCase(), { debug: 0 });
-    peer.on('open', () => { if (NET.peer !== peer) return; NET.status = netAlive() ? 'connected' : 'waiting'; netUi(); });
-    peer.on('connection', conn => {
-      if (NET.peer !== peer) return;
-      if (netAlive()) { conn.on('open', () => { try { conn.send(JSON.stringify({ t: 'full' })); } catch (e) {} setTimeout(() => conn.close(), 400); }); return; }
-      NET.conn = conn;
-      conn.on('data', netRecv);
-      conn.on('close', () => { if (NET.conn !== conn) return; NET.conn = null; NET.partner = null; NET.rtt = 0;
-        if (NET.role === 'host') { NET.status = 'waiting'; netUi(); if (state.phase === 'playing') pushToastLocal('Your friend left the game', '#c8361c'); } });
-      conn.on('error', () => {});
-    });
+    peer.on('open', () => { if (NET.peer !== peer) return; NET.status = netAlive() ? 'connected' : 'waiting'; netUi(); netRelayHost(NET.code); });
+    peer.on('connection', conn => { if (NET.peer === peer) netHostAdopt(conn); });
     peer.on('disconnected', () => { if (NET.peer === peer && !peer.destroyed) { try { peer.reconnect(); } catch (e) {} } });
     peer.on('error', err => {
       if (NET.peer !== peer) return;
@@ -8016,7 +8141,17 @@ async function netJoin(code) {
   NET.role = 'guest'; NET.code = code; NET.status = 'connecting'; NET.err = ''; netUi();
   let Peer; try { Peer = await netLoadLib(); } catch (e) { NET.status = 'error'; NET.err = e.message; netUi(); return; }
   if (NET.role !== 'guest') return;
+  // Try a direct link first. If it fails or stalls (most often: the routers
+  // block it), fall back to the relay. ?relay in the URL skips straight there.
+  if (/[?&]relay\b/.test(location.search)) { NET.peer = null; netRelayJoin(code, null); return; }
   const peer = NET.peer = new Peer({ debug: 0 });
+  let fell = false;
+  const fallback = (err) => {
+    if (fell || NET.peer !== peer || NET.status !== 'connecting') return;
+    fell = true; NET.peer = null; NET.conn = null;
+    try { peer.destroy(); } catch (e) {}
+    netRelayJoin(code, err);
+  };
   peer.on('open', () => {
     if (NET.peer !== peer) return;
     const conn = NET.conn = peer.connect(NET_PREFIX + code.toLowerCase(), { reliable: true, serialization: 'raw' });
@@ -8025,14 +8160,15 @@ async function netJoin(code) {
     conn.on('close', () => { if (NET.conn === conn) netHostGone(); });
     conn.on('error', () => {});
   });
-  peer.on('error', err => { if (NET.peer !== peer || netAlive()) return; NET.status = 'error'; NET.err = netErrText(err); netUi(); });
-  setTimeout(() => { if (NET.peer === peer && NET.status === 'connecting') { NET.status = 'error'; NET.err = 'Couldn\'t connect to that game. Check the code, or ask your friend to create a new lobby.'; netUi(); } }, 15000);
+  peer.on('error', err => { if (NET.peer !== peer || netAlive()) return; fallback(err); });
+  setTimeout(() => fallback(null), NET_DIRECT_MS);
 }
 // Leave co-op entirely. `quiet` skips UI changes (used when switching role).
 function netLeave(quiet) {
   const wasGuestInRun = NET.role === 'guest' && state.phase === 'playing';
   if (NET.conn) { try { NET.conn.close(); } catch (e) {} }
   if (NET.peer) { try { NET.peer.destroy(); } catch (e) {} }
+  netRelayStop();
   Object.assign(NET, { role: null, peer: null, conn: null, code: '', status: 'off', ready: false, partner: null, rtt: 0, h: null, modalSent: null, parts: {}, events: [] });
   netShowRemoteModal(false);
   if (wasGuestInRun && !quiet) netToMenu();
@@ -8100,7 +8236,8 @@ function netHostFrame() {
   if (now - NET.lastPing > 2000) { NET.lastPing = now; netSend({ t: 'ping', ts: now }); updateCoopChip(); }
   if (!NET.ready || state.phase !== 'playing') return;
   if (NET.needInit) { netSendInit(); return; }
-  if (now - NET.lastSnap < NET_SNAP_MS) return;
+  if (now - NET.lastSnap < netSnapMs()) return;
+  if (NET.conn.relay && NET.conn.pending > 6) return;       // relay is behind: skip, the next snapshot carries everything
   const dc = NET.conn.dataChannel;
   if (dc && dc.bufferedAmount > 96 * 1024) return;          // slow link: let it drain, the next snapshot carries everything
   NET.lastSnap = now;
@@ -8251,7 +8388,7 @@ function netGuestMsg(m) {
     case 'init': netApplyInit(m); return;
     case 'snap': if (state.phase === 'playing') netApplySnap(m, false); return;
     case 'modal': netShowRemoteModal(!!m.open, typeof m.html === 'string' ? m.html : ''); return;
-    case 'end': G.queue.push([performance.now() + NET_DELAY + 300, netGuestEnd]); return;
+    case 'end': G.queue.push([performance.now() + netDelay() + 300, netGuestEnd]); return;
     case 'menu': if (state.phase === 'playing' || state.phase === 'gameover') netToMenu(); NET.status = 'lobby'; showCoop(); return;
     case 'cur': NET.partner = m.off ? null : { x: +m.x || 0, y: +m.y || 0, t: performance.now() }; return;
     case 'ping': netSend({ t: 'pong', ts: m.ts }); return;
@@ -8276,7 +8413,7 @@ function netApplyInit(m) {
   SW.invalidate(); ensureAudio(); updateCoopChip();
 }
 function netApplySnap(m, init) {
-  const now = performance.now(), rel = now + NET_DELAY, s = m.s || {};
+  const now = performance.now(), rel = now + netDelay(), s = m.s || {};
   if (Array.isArray(m.k)) for (const k of m.k) G.dict.push(k);
   if (Array.isArray(m.art)) { state.artifacts = m.art.map(id => ARTIFACT_POOL[id] ? makeArtifact(id) : null).filter(Boolean); rebuildArtifactCache(); }
   if (Array.isArray(m.q)) state.enemiesToSpawn = netRevive(m.q);
@@ -8285,7 +8422,7 @@ function netApplySnap(m, init) {
   for (const k in s) if (k !== '__proto__' && k !== 'constructor') state[k] = netRevive(s[k]);
   // Visuals run NET_DELAY behind the newest snapshot; so does the clock they read.
   if (typeof m.time === 'number') {
-    const target = m.time - (state.paused ? 0 : (NET_DELAY / 1000) * (state.speed || 1));
+    const target = m.time - (state.paused ? 0 : (netDelay() / 1000) * (state.speed || 1));
     if (init || Math.abs(target - state.time) > 0.75) { state.time = target; G.timeErr = 0; } else G.timeErr = target - state.time;
   }
   if (m.sh) G.queue.push([rel, () => { state.camera.shakeAmt = Math.max(state.camera.shakeAmt, m.sh); }]);
@@ -8334,7 +8471,7 @@ function netSample(o, now, f) {
   if (f) { if ('x' in f) n.x = o.x; if ('y' in f) n.y = o.y; if ('angle' in f) n.a = o.angle; }
   const S = o.__s || (o.__s = []);
   // After a still spell, hold the old spot until just before this sample so motion starts on time.
-  if (S.length && now - S[S.length - 1][0] > NET_SNAP_MS * 1.6) { const l = S[S.length - 1]; S.push([now - NET_SNAP_MS, l[1], l[2], l[3]]); }
+  if (S.length && now - S[S.length - 1][0] > netSnapMs() * 1.6) { const l = S[S.length - 1]; S.push([now - netSnapMs(), l[1], l[2], l[3]]); }
   S.push([now, n.x, n.y, n.a]); if (S.length > 8) S.splice(0, S.length - 8);
 }
 function netInterp(o, rt) {
@@ -8357,7 +8494,7 @@ function netGuestFrame(dt) {
   state.time += gdt;
   if (G.timeErr) { const c = G.timeErr * Math.min(1, dt * 3); state.time += c; G.timeErr -= c; }
   _statsCacheFrame++;
-  const rt = now - NET_DELAY;
+  const rt = now - netDelay();
   for (const name of ['towers', 'enemies', 'projectiles', 'shardDrops']) { const a = state[name]; if (a) for (const o of a) netInterp(o, rt); }
   for (const p of state.projectiles) { const tr = p.trail || (p.trail = []); tr.push({ x: p.x, y: p.y }); if (tr.length > 6) tr.shift(); }
   if (gdt > 0) {
@@ -8486,7 +8623,7 @@ function updateCoopChip() {
   const on = !!NET.role && (state.phase === 'playing' || state.phase === 'gameover');
   el.classList.toggle('show', on); if (!on) return;
   const here = netAlive() && (NET.role === 'guest' || NET.status === 'connected');
-  const who = NET.role === 'host' ? 'Friend' : 'Host', ms = here && NET.rtt ? ` · ${Math.round(NET.rtt)} ms` : '';
+  const who = NET.role === 'host' ? 'Friend' : 'Host', ms = here && NET.rtt ? ` · ${Math.round(NET.rtt)} ms${NET.conn.relay ? ' · relay' : ''}` : '';
   const html = `<b>CO-OP</b><span class="dot ${here ? 'on' : ''}"></span>${here ? who + ms : `Waiting · code <b class="code">${NET.code}</b>`}`;
   if (el._h !== html) { el._h = html; el.innerHTML = html; }
 }
