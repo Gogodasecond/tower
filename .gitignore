@@ -1,0 +1,7 @@
+# Only the game itself is published. Design labs, backups, balance logs and
+# local preview tooling stay on this computer.
+*-lab*.html
+_backup/
+*.json
+.claude/
+HANDOFF.md
